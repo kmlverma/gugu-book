@@ -5,6 +5,7 @@ export interface Highlight {
   text: string;
   color: string;
   addedAt: number;
+  note?: string;
 }
 
 export interface Bookmark {
@@ -26,6 +27,7 @@ export interface Book {
   bookmark?: any; // legacy single bookmark — kept for backward compat
   bookmarks?: Bookmark[];
   cachedLocations?: string; // JSON from epubjs locations.save() — pre-computed CFI array
+  cachedLayoutTotal?: number; // Visual page count from last recalcLayoutPaginationInBackground run
   addedAt: number;
 }
 

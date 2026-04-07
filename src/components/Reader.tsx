@@ -66,6 +66,9 @@ export default function Reader({ book, onClose }: ReaderProps) {
   const [selectedText, setSelectedText] = useState<{ text: string, cfiRange: string } | null>(null);
   const [selectionPosition, setSelectionPosition] = useState<{ x: number, y: number } | null>(null);
   const [highlightToErase, setHighlightToErase] = useState<{ cfiRange: string, position: { x: number, y: number } } | null>(null);
+  // Pending highlight (two-step: pick colour → add note → save)
+  const [pendingHighlight, setPendingHighlight] = useState<{ text: string; cfiRange: string; color: string } | null>(null);
+  const [pendingNote, setPendingNote] = useState('');
 
   // TOC
   const [toc, setToc] = useState<TocItem[]>([]);
@@ -80,17 +83,31 @@ export default function Reader({ book, onClose }: ReaderProps) {
     return [];
   });
   const [annotationsTab, setAnnotationsTab] = useState<'bookmarks' | 'highlights'>('highlights');
-  const [pageTone, setPageTone] = useState<'light' | 'sepia' | 'dark'>('light');
+  const [pageTone, setPageTone] = useState<'light' | 'sepia' | 'dark'>(() => {
+    try {
+      const saved = localStorage.getItem('gugu-reader-theme');
+      if (saved === 'light' || saved === 'sepia' || saved === 'dark') return saved;
+    } catch {/* storage unavailable */}
+    return 'light';
+  });
 
-  // Page transitions
-  const [pageTransition, setPageTransition] = useState<PageTransition>('curl');
+  // Page transitions — default is Fade; user preference overrides via localStorage
+  const [pageTransition, setPageTransition] = useState<PageTransition>(() => {
+    try {
+      const saved = localStorage.getItem('gugu-reader-page-turn');
+      if (saved === 'slide' || saved === 'fastfade' || saved === 'curl') return saved;
+    } catch {/* storage unavailable */}
+    return 'fastfade';
+  });
   const [showPageIndicator, setShowPageIndicator] = useState(false);
   const [transitionVisual, setTransitionVisual] = useState<TransitionVisualState | null>(null);
   const pageIndicatorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isNavigatingRef = useRef(false);
+  const lastNavTime = useRef(0);
   const sectionPageTotalsRef = useRef<number[]>([]);
   const sectionOffsetsRef = useRef<number[]>([]);
   const paginationRecalcTokenRef = useRef(0);
+  const maxTotalPagesRef = useRef(0);
 
   // Search
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -104,6 +121,13 @@ export default function Reader({ book, onClose }: ReaderProps) {
   const edgeGestureStart = useRef<{ x: number; y: number; nearEdge: boolean } | null>(null);
   const searchHighlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSearchHighlightCfi = useRef<string | null>(null);
+  // Stores the epubjs CFI produced by the 'selected' event so the mouseup/touchend
+  // handlers (injected into each iframe) can pick it up without a stale closure.
+  const pendingSelectionCfiRef = useRef<string | null>(null);
+  const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Ref always mirrors pageTone so callbacks captured in closures (rendered, hooks.content)
+  // always read the live theme value instead of the stale value from mount time.
+  const pageToneRef = useRef<'light' | 'sepia' | 'dark'>(pageTone);
 
   const getSearchSessionKey = () => (book.id ? `gugu-reader-search-${book.id}` : null);
   const getAnnotationsTabSessionKey = () => (book.id ? `gugu-reader-annotations-tab-${book.id}` : null);
@@ -204,7 +228,9 @@ export default function Reader({ book, onClose }: ReaderProps) {
         'padding': '0 !important',
       },
       'body': {
-        'padding': '24px 16px !important',
+        // Do NOT set padding here — epub.js columns() sets its own padding that the
+        // SVG highlight overlay (marks-pane) is calibrated against. Overriding it
+        // causes highlights to drift away from the actual text.
         'max-width': '100% !important',
         'overflow-x': 'hidden !important',
         'color': `${currentTone.color} !important`,
@@ -215,7 +241,7 @@ export default function Reader({ book, onClose }: ReaderProps) {
         'overflow-wrap': 'break-word !important',
         'white-space': 'normal !important',
         'background-color': `${currentTone.bg} !important`,
-        'margin': '0 auto !important',
+        'margin': '0 !important',
         'box-sizing': 'border-box !important',
       },
       'img': {
@@ -230,12 +256,9 @@ export default function Reader({ book, onClose }: ReaderProps) {
         'max-width': '100% !important',
         'box-sizing': 'border-box !important',
         '-webkit-touch-callout': 'none !important',
-        '-webkit-user-select': 'text !important',
-        '-moz-user-select': 'text !important',
-        'user-select': 'text !important',
       },
       '::selection': {
-        'background': 'transparent !important',
+        'background': 'rgba(0, 122, 255, 0.3) !important', // Make selection visible instead of transparent
       },
     });
     
@@ -394,6 +417,17 @@ export default function Reader({ book, onClose }: ReaderProps) {
       };
     };
 
+    // safeSetTotalPages ensures the displayed total never decreases during a session.
+    // This prevents the "Page 1 of 20 → Page 1 of 47" flicker caused by the three
+    // async phases each calling setTotalPages with a different intermediate value.
+    const safeSetTotalPages = (n: number | null) => {
+      if (n === null || !Number.isFinite(n) || n <= 0) return;
+      if (n >= maxTotalPagesRef.current) {
+        maxTotalPagesRef.current = n;
+        setTotalPages(n);
+      }
+    };
+
     const syncPaginationFromLocation = (loc: any) => {
       const metrics = calculateDynamicPageMetrics(loc);
       if (!metrics.cfi) return;
@@ -401,13 +435,15 @@ export default function Reader({ book, onClose }: ReaderProps) {
       setLocation(metrics.cfi);
       setProgress(metrics.progress);
       setCurrentPage(metrics.current);
-      setTotalPages(metrics.total);
-      setLocationsReady(metrics.total !== null && metrics.total > 0);
+      if (metrics.total !== null) safeSetTotalPages(metrics.total);
+      setLocationsReady(maxTotalPagesRef.current > 0);
       updateProgressInDb(metrics.progress, metrics.cfi);
     };
 
     const handleRegionTap = (x: number) => {
+      // Use viewer container width for safe, scale-independent zone calculation
       const width = viewerRef.current?.clientWidth || window.innerWidth;
+      // 20% left, 60% center, 20% right distribution
       const leftMax = width * 0.2;
       const rightMin = width * 0.8;
 
@@ -432,6 +468,8 @@ export default function Reader({ book, onClose }: ReaderProps) {
       setActiveTab(null);
       setSelectedText(null);
       setHighlightToErase(null);
+      setPendingHighlight(null);
+      setPendingNote('');
     };
 
     // Pre-load cached locations before first render so the relocated event already
@@ -442,7 +480,13 @@ export default function Reader({ book, onClose }: ReaderProps) {
         preloadedTotal = typeof locationsApi.length === 'function' ? locationsApi.length() : 0;
         if (preloadedTotal > 0) {
           locationsPreloaded = true;
-          setTotalPages(preloadedTotal);
+          // Use the more accurate layout total if available (avoids the CFI-based count
+          // being overridden later when recalcLayoutPaginationInBackground resolves).
+          const initialTotal = (book.cachedLayoutTotal && book.cachedLayoutTotal > preloadedTotal)
+            ? book.cachedLayoutTotal
+            : preloadedTotal;
+          maxTotalPagesRef.current = initialTotal;
+          setTotalPages(initialTotal);
           setLocationsReady(true);
         }
       } catch (err) {
@@ -452,8 +496,10 @@ export default function Reader({ book, onClose }: ReaderProps) {
 
     const generateAndCacheLocations = async () => {
       try {
-        setLocationsReady(false);
-        setTotalPages(null);
+        // Only reset locationsReady if we have nothing to show yet
+        if (maxTotalPagesRef.current <= 0) {
+          setLocationsReady(false);
+        }
         // Always generate at baseline stride so the cache is font-agnostic
         await locationsApi.generate(1024);
       } catch (err) {
@@ -480,7 +526,7 @@ export default function Reader({ book, onClose }: ReaderProps) {
         syncPaginationFromLocation(currentLoc);
       } else {
         if (generatedTotal > 0) {
-          setTotalPages(generatedTotal);
+          safeSetTotalPages(generatedTotal);
           setLocationsReady(true);
         }
       }
@@ -546,8 +592,12 @@ export default function Reader({ book, onClose }: ReaderProps) {
         sectionOffsetsRef.current = buildOffsets(totals);
         const renderedTotal = sum(totals);
         if (renderedTotal > 0) {
-          setTotalPages(renderedTotal);
+          safeSetTotalPages(renderedTotal);
           setLocationsReady(true);
+          // Persist the layout total so next open is instant
+          if (book.id) {
+            db.books.update(book.id, { cachedLayoutTotal: renderedTotal }).catch(() => {});
+          }
           const currentLoc = renditionInstance.currentLocation?.();
           if (currentLoc) {
             syncPaginationFromLocation(currentLoc);
@@ -581,25 +631,180 @@ export default function Reader({ book, onClose }: ReaderProps) {
 
     renditionInstance.on('rendered', () => {
       if (isMounted) {
-        applyStyles(renditionInstance, pageTone);
+        // Use pageToneRef.current – NOT the closed-over pageTone state variable –
+        // so this always applies the live theme even after the user has changed it.
+        applyStyles(renditionInstance, pageToneRef.current);
       }
     });
 
-    // Add smooth transition to iframe body and suppress native menu
+    // Inject theme colours directly into each iframe's body as soon as its content
+    // is created. This avoids a white/default flash before themes.default() CSS loads
+    // and ensures the colour is right even before the rendered event fires.
     renditionInstance.hooks.content.register((contents: any) => {
       const body = contents.document.body;
       const html = contents.document.documentElement;
+      const tone = TONE_COLORS[pageToneRef.current];
+
+      if (html) {
+        html.style.backgroundColor = tone.bg;
+      }
+
       if (body) {
-        body.style.margin = '0';
-        body.style.padding = '0';
+        // Do NOT override margin/padding — epub.js columns() sets these for
+        // proper SVG highlight overlay alignment.
         body.style.width = '100%';
         body.style.boxSizing = 'border-box';
         body.style.webkitTouchCallout = 'none'; // Suppress mobile callout menu
+        body.style.backgroundColor = tone.bg;
+        body.style.color = tone.color;
       }
 
       // Suppress native context menu
       contents.document.addEventListener('contextmenu', (e: Event) => {
         e.preventDefault();
+      });
+
+      // ── Native Tap & Selection Handling ─────────────────────────────────────
+      // We handle touches and clicks natively on the iframe document to bypass 
+      // epub.js's flaky event wrapping which loses coordinates on mobile and
+      // conflicts with text selection.
+
+      let touchStartX = 0;
+      let touchStartY = 0;
+      let touchStartTime = 0;
+      let selectionActive = false;
+      let lastSelectionClearTime = 0;
+      let lastTapTime = 0;
+
+      const isHighlightClick = (el: any) => el && typeof el.closest === 'function' && el.closest('.hl-class');
+
+      const captureSelection = () => {
+        const sel = contents.window?.getSelection?.();
+        if (!sel || sel.rangeCount === 0 || !sel.toString().trim()) return;
+
+        const range = sel.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+        if (!rect || (rect.width === 0 && rect.height === 0)) return;
+
+        const text = sel.toString().trim();
+        const cfi = pendingSelectionCfiRef.current;
+        if (!cfi || !text) return;
+
+        // Convert iframe-local coords to page coords
+        const iframeEl = contents.document.defaultView?.frameElement as HTMLElement | null;
+        const iframeRect = iframeEl?.getBoundingClientRect() ?? { left: 0, top: 0 };
+        const x = iframeRect.left + rect.left + rect.width / 2;
+        const y = iframeRect.top + rect.top;
+
+        setPendingHighlight(null);
+        setPendingNote('');
+        setSelectedText({ text, cfiRange: cfi });
+        setSelectionPosition({ x, y });
+        pendingSelectionCfiRef.current = null;
+        
+        // We do NOT clear the native selection here so it is visibly retained!
+      };
+      
+      // Pass a reference of captureSelection to the rendition instance so the 'selected' event can invoke it
+      (renditionInstance as any)._captureSelection = captureSelection;
+
+      contents.document.addEventListener('touchstart', (e: TouchEvent) => {
+        if (e.touches.length > 0) {
+          // Reverted to clientX: screenX conflicted with devicePixelRatio hardware scaling
+          touchStartX = e.touches[0].clientX;
+          touchStartY = e.touches[0].clientY;
+          touchStartTime = Date.now();
+        }
+      }, { passive: true });
+
+      contents.document.addEventListener('touchend', (e: TouchEvent) => {
+        if (e.changedTouches.length === 0) return;
+        const touch = e.changedTouches[0];
+        
+        const dx = Math.abs(touch.clientX - touchStartX);
+        const dy = Math.abs(touch.clientY - touchStartY);
+        const dt = Date.now() - touchStartTime;
+
+        // Detect horizontal swipe gesture (fast, mostly horizontal, > 40px)
+        if (dx > 40 && dx > dy * 1.5 && dt < 400) {
+          if (isHighlightClick(e.target)) return;
+          
+          setTimeout(() => {
+             const sel = contents.window?.getSelection?.();
+             // Only execute swipe if it didn't result in a text selection
+             if (!sel || sel.isCollapsed || sel.toString().trim().length === 0) {
+                 if (touch.clientX < touchStartX) {
+                     next().catch(console.error); // Swipe left -> Next page
+                 } else {
+                     prev().catch(console.error); // Swipe right -> Previous page
+                 }
+             } else {
+                 captureSelection();
+             }
+          }, 60);
+          return;
+        }
+
+        // Tap gestures: Relaxed tolerance up to 30px to account for fat fingers
+        // slipping on the glass, especially near screen edges.
+        if (dx < 30 && dy < 30 && dt < 400) {
+          if (isHighlightClick(e.target)) return;
+          
+          lastTapTime = Date.now(); // Register tap immediately to block synthetic clicks
+          
+          setTimeout(() => {
+            if (Date.now() - lastSelectionClearTime < 300) return; // Tap was used to dismiss selection
+            const sel = contents.window?.getSelection?.();
+            if (!sel || sel.isCollapsed || sel.toString().trim().length === 0) {
+               if (!selectionActive) {
+                  // Forward inner logical clientX
+                  handleRegionTap(touch.clientX);
+               }
+            } else {
+               captureSelection(); // Trigger capture if tap resulted in selection (e.g. double tap)
+            }
+          }, 60);
+        } else {
+           // It was a non-swipe drag/long-press. Check if it created a selection.
+           setTimeout(captureSelection, 120);
+        }
+      });
+
+      contents.document.addEventListener('click', (e: MouseEvent) => {
+        if (Date.now() - lastTapTime < 500) return; // Already handled by touch
+        if (isHighlightClick(e.target)) return;
+
+        const sel = contents.window?.getSelection?.();
+        if (!sel || sel.isCollapsed || sel.toString().trim().length === 0) {
+          if (!selectionActive && Date.now() - lastSelectionClearTime >= 300) {
+             lastTapTime = Date.now();
+             handleRegionTap(e.clientX);
+          }
+        }
+      });
+
+      contents.document.addEventListener('mouseup', () => {
+         // Fallback for desktop selection
+         setTimeout(captureSelection, 80);
+      });
+
+      contents.document.addEventListener('selectionchange', () => {
+         const sel = contents.window?.getSelection?.();
+         if (!sel || sel.isCollapsed || sel.toString().trim().length === 0) {
+            if (selectionActive) {
+                selectionActive = false;
+                lastSelectionClearTime = Date.now();
+                // Schedule clear to avoid react state updates during event rendering locks
+                setTimeout(() => {
+                    setSelectedText(null);
+                    setPendingHighlight(null);
+                    setPendingNote('');
+                    setHighlightToErase(null);
+                }, 0);
+            }
+         } else {
+            selectionActive = true;
+         }
       });
     });
 
@@ -608,50 +813,15 @@ export default function Reader({ book, onClose }: ReaderProps) {
       syncPaginationFromLocation(loc);
     });
 
-    renditionInstance.on('click', (e: any) => {
-      // Check if clicked on a highlight
-      if (e.target && typeof e.target.closest === 'function' && e.target.closest('.hl-class')) {
-        return;
+    let selectionTimeout: any = null;
+    renditionInstance.on('selected', (cfiRange: string) => {
+      pendingSelectionCfiRef.current = cfiRange;
+      if (typeof (renditionInstance as any)._captureSelection === 'function') {
+         if (selectionTimeout) clearTimeout(selectionTimeout);
+         // Defers the popup by 300ms so if the user is extending the selection bounds
+         // using Android text handles, it always locks onto the FINAL selection CFI!
+         selectionTimeout = setTimeout(() => (renditionInstance as any)._captureSelection(), 300);
       }
-
-      const contents = (renditionInstance as any).getContents();
-      let hasSelection = false;
-      
-      const checkSelection = (win: Window) => {
-        const sel = win.getSelection();
-        return !!sel && sel.toString().trim().length > 0;
-      };
-
-      if (Array.isArray(contents) && contents.length > 0) {
-        hasSelection = contents.some((content: any) => checkSelection(content.window));
-      } else if (contents && contents.window) {
-        hasSelection = checkSelection(contents.window);
-      }
-
-      if (hasSelection) {
-        if (selectedText) {
-          if (Array.isArray(contents) && contents.length > 0) {
-            contents[0].window.getSelection()?.removeAllRanges();
-          } else if (contents && contents.window) {
-            contents.window.getSelection()?.removeAllRanges();
-          }
-          setActiveTab(null);
-          setSelectedText(null);
-          setHighlightToErase(null);
-        }
-      } else {
-        handleRegionTap(e.clientX);
-      }
-    });
-
-    renditionInstance.on('selected', (cfiRange: string, contents: any, selection: Selection) => {
-      const iframeSelection = contents?.window?.getSelection?.() || selection;
-      if (!iframeSelection || iframeSelection.rangeCount === 0) {
-        return;
-      }
-
-      // Immediately clear native selection so the OS menu does not overlap our UI
-      iframeSelection.removeAllRanges();
     });
 
     epubInstance.ready.then(async () => {
@@ -690,9 +860,14 @@ export default function Reader({ book, onClose }: ReaderProps) {
         await generateAndCacheLocations();
       }
 
-      recalcLayoutPaginationInBackground().catch((err) => {
-        console.warn('[reader-pagination] layout:background-recalc-failed', err);
-      });
+      // Skip the expensive layout recalc if we already have a warm cached total
+      // AND a preloaded CFI list — the number won't be meaningfully different.
+      const hasBothCaches = locationsPreloaded && (book.cachedLayoutTotal ?? 0) > 0;
+      if (!hasBothCaches) {
+        recalcLayoutPaginationInBackground().catch((err) => {
+          console.warn('[reader-pagination] layout:background-recalc-failed', err);
+        });
+      }
 
       flashPageIndicator();
     }).catch((err) => {
@@ -802,12 +977,35 @@ export default function Reader({ book, onClose }: ReaderProps) {
     }
   }, [book.id, annotationsTab]);
 
-  // Re-apply styles when tone changes.
+  // Keep pageToneRef in sync and persist the user's choice.
+  // Also re-apply styles to the active rendition so already-open iframes update immediately.
   useEffect(() => {
+    pageToneRef.current = pageTone;
+    try { localStorage.setItem('gugu-reader-theme', pageTone); } catch {/* noop */}
     if (rendition) {
       applyStyles(rendition, pageTone);
+      // Force re-apply to any currently-loaded iframes via getContents
+      try {
+        const tone = TONE_COLORS[pageTone];
+        const contents = (rendition as any).getContents?.();
+        const contentList = Array.isArray(contents) ? contents : contents ? [contents] : [];
+        contentList.forEach((c: any) => {
+          const html = c?.document?.documentElement;
+          const body = c?.document?.body;
+          if (html) html.style.backgroundColor = tone.bg;
+          if (body) {
+            body.style.backgroundColor = tone.bg;
+            body.style.color = tone.color;
+          }
+        });
+      } catch {/* noop — rendition may not have content yet */}
     }
   }, [pageTone, rendition]);
+
+  // Persist page-turn preference so it survives reopening the book.
+  useEffect(() => {
+    try { localStorage.setItem('gugu-reader-page-turn', pageTransition); } catch {/* noop */}
+  }, [pageTransition]);
 
 
 
@@ -820,29 +1018,41 @@ export default function Reader({ book, onClose }: ReaderProps) {
     }
   };
 
-  const addHighlight = async (color: string = '#FFD700') => {
-    if (!selectedText || !rendition || !book.id) return;
+  const confirmHighlight = async (note?: string) => {
+    if (!pendingHighlight || !rendition || !book.id) return;
 
     const newHighlight: Highlight = {
-      cfiRange: selectedText.cfiRange,
-      text: selectedText.text,
-      color,
-      addedAt: Date.now()
+      cfiRange: pendingHighlight.cfiRange,
+      text: pendingHighlight.text,
+      color: pendingHighlight.color,
+      addedAt: Date.now(),
+      ...(note?.trim() ? { note: note.trim() } : {}),
     };
 
     const updatedHighlights = [...highlights, newHighlight];
     setHighlights(updatedHighlights);
-    
-    rendition.annotations.add('highlight', selectedText.cfiRange, {}, (e: any) => {
-      const rect = e.target.getBoundingClientRect();
-      setHighlightToErase({
-        cfiRange: selectedText.cfiRange,
-        position: { x: rect.left + rect.width / 2, y: rect.top }
-      });
-    }, 'hl-class', { fill: color });
-    
+
+    rendition.annotations.add(
+      'highlight',
+      pendingHighlight.cfiRange,
+      {},
+      (e: any) => {
+        const rect = e.target.getBoundingClientRect();
+        setHighlightToErase({
+          cfiRange: pendingHighlight.cfiRange,
+          position: { x: rect.left + rect.width / 2, y: rect.top },
+        });
+      },
+      'hl-class',
+      { fill: pendingHighlight.color, "fill-opacity": "0.3", "mix-blend-mode": "multiply" }
+    );
+
     await db.books.update(book.id, { highlights: updatedHighlights });
+
+    setPendingHighlight(null);
+    setPendingNote('');
     setSelectedText(null);
+    setSelectionPosition(null);
   };
 
   const removeHighlight = async (cfiRange: string) => {
@@ -850,12 +1060,15 @@ export default function Reader({ book, onClose }: ReaderProps) {
 
     const updatedHighlights = highlights.filter(h => h.cfiRange !== cfiRange);
     setHighlights(updatedHighlights);
-    
+
     rendition.annotations.remove(cfiRange, 'highlight');
-    
+
     await db.books.update(book.id, { highlights: updatedHighlights });
     setSelectedText(null);
+    setSelectionPosition(null);
     setHighlightToErase(null);
+    setPendingHighlight(null);
+    setPendingNote('');
   };
 
   const toggleBookmark = async () => {
@@ -988,6 +1201,8 @@ export default function Reader({ book, onClose }: ReaderProps) {
     setShowQuickActions(false);
     setSelectedText(null);
     setHighlightToErase(null);
+    setPendingHighlight(null);
+    setPendingNote('');
 
     if (!showControls) {
       flashPageIndicator();
@@ -1204,7 +1419,7 @@ export default function Reader({ book, onClose }: ReaderProps) {
         try {
           rendition.annotations.add('highlight', candidate, {}, undefined, 'search-hit-temp', {
             fill: '#FACC15',
-            'fill-opacity': '0.40',
+            "fill-opacity": "0.40",
           });
           highlightCfi = candidate;
           break;
@@ -1399,6 +1614,13 @@ export default function Reader({ book, onClose }: ReaderProps) {
   const animateTransition = async (dir: NavigationDirection) => {
     if (!rendition || isNavigatingRef.current) return;
 
+    // Debounce: reject any navigation that arrives within 400ms of the last one.
+    // This blocks the synthetic click that fires after onTouchEnd on mobile, and any
+    // other rapid-fire invocations, so a single physical tap always advances by exactly 1.
+    const now = Date.now();
+    if (now - lastNavTime.current < 400) return;
+    lastNavTime.current = now;
+
     isNavigatingRef.current = true;
 
     try {
@@ -1491,49 +1713,133 @@ export default function Reader({ book, onClose }: ReaderProps) {
         )}
       </AnimatePresence>
 
-      {/* Selection Menu */}
-      <AnimatePresence>
-        {selectedText && selectionPosition && (
+      {/* Highlight Bubble — Step 1: colour picker / Step 2: note + save */}
+      <AnimatePresence mode="wait">
+        {selectedText && !pendingHighlight && selectionPosition && (
           <motion.div
-            initial={{ opacity: 0, scale: 0.8, y: 0 }}
-            animate={{ opacity: 1, scale: 1, y: -60 }}
-            exit={{ opacity: 0, scale: 0.8 }}
-            style={{ 
-              left: selectionPosition.x, 
-              top: selectionPosition.y,
+            key="color-picker"
+            initial={{ opacity: 0, scale: 0.85, x: '-50%', y: '-100%' }}
+            animate={{ opacity: 1, scale: 1, x: '-50%', y: '-100%' }}
+            exit={{ opacity: 0, scale: 0.85, x: '-50%', y: '-100%' }}
+            transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+            style={{
+              left: Math.min(
+                Math.max(selectionPosition.x, 90), // Reduced margins for smaller panel
+                (typeof window !== 'undefined' ? window.innerWidth : 375) - 90,
+              ),
+              top: Math.max(selectionPosition.y - 8, 80),
               position: 'absolute',
               zIndex: 1000,
-              transform: 'translateX(-50%)'
             }}
-            className="flex items-center gap-3 p-2 bg-white/95 dark:bg-zinc-800/95 backdrop-blur-3xl rounded-full shadow-[0_10px_40px_rgba(0,0,0,0.3)] border border-white/40"
+            className="flex items-center gap-1.5 p-1.5 bg-white/95 backdrop-blur-3xl rounded-full shadow-[0_10px_40px_rgba(0,0,0,0.28)] border border-white/40"
+            onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center gap-2 px-2">
-              <motion.button 
-                whileHover={{ scale: 1.2 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={() => addHighlight('#FFD700')}
-                className="w-8 h-8 rounded-full bg-yellow-400 border-2 border-white shadow-sm cursor-pointer"
-              />
-              <motion.button 
-                whileHover={{ scale: 1.2 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={() => addHighlight('#90EE90')}
-                className="w-8 h-8 rounded-full bg-green-400 border-2 border-white shadow-sm cursor-pointer"
-              />
-              <motion.button 
-                whileHover={{ scale: 1.2 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={() => addHighlight('#ADD8E6')}
-                className="w-8 h-8 rounded-full bg-blue-400 border-2 border-white shadow-sm cursor-pointer"
-              />
+            <div className="flex items-center gap-1.5 px-1.5">
+              {([
+                { color: '#FFD700', bg: 'bg-yellow-400' },
+                { color: '#90EE90', bg: 'bg-green-400' },
+                { color: '#7EBCE6', bg: 'bg-blue-300' },
+                { color: '#FF9EAE', bg: 'bg-rose-300' },
+              ] as const).map(({ color, bg }) => (
+                <motion.button
+                  key={color}
+                  whileHover={{ scale: 1.18 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={() => {
+                    setPendingHighlight({ text: selectedText.text, cfiRange: selectedText.cfiRange, color });
+                    setPendingNote('');
+                  }}
+                  className={`w-7 h-7 rounded-full ${bg} border border-white/50 shadow-sm cursor-pointer flex-shrink-0`}
+                />
+              ))}
             </div>
-            <div className="w-px h-6 bg-black/10 dark:bg-white/10" />
-            <button 
-              onClick={() => setSelectedText(null)}
-              className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-full transition-colors"
+            <div className="w-px h-6 bg-black/10" />
+            <button
+              onClick={() => { setSelectedText(null); setSelectionPosition(null); }}
+              className="p-1.5 hover:bg-black/5 rounded-full transition-colors"
             >
-              <X size={18} />
+              <X size={16} className="text-zinc-500" />
             </button>
+          </motion.div>
+        )}
+
+        {pendingHighlight && selectionPosition && (
+          <motion.div
+            key="note-panel"
+            initial={{ opacity: 0, scale: 0.88, x: '-50%', y: '-50%' }}
+            animate={{ opacity: 1, scale: 1, x: '-50%', y: '-50%' }}
+            exit={{ opacity: 0, scale: 0.88, x: '-50%', y: '-50%' }}
+            transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+            style={{
+              position: 'fixed',
+              top: '40%', // slightly above center so keyboard definitely misses it
+              left: '50%',
+              zIndex: 1000,
+              width: '90%',
+              maxWidth: '320px',
+            }}
+            className="bg-white rounded-2xl shadow-[0_20px_60px_rgba(0,0,0,0.35)] border border-white/50 overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header: colour dot + truncated text + close */}
+            <div className="flex items-center gap-2 px-3 pt-3 pb-2">
+              <div
+                className="w-3 h-3 rounded-full flex-shrink-0 ring-2 ring-white shadow-sm"
+                style={{ backgroundColor: pendingHighlight.color }}
+              />
+              <p className="text-[11px] text-zinc-400 flex-1 truncate leading-snug">
+                {pendingHighlight.text}
+              </p>
+              <button
+                onClick={() => { setPendingHighlight(null); setPendingNote(''); setSelectedText(null); setSelectionPosition(null); }}
+                className="p-0.5 hover:bg-black/5 rounded-full transition-colors flex-shrink-0"
+              >
+                <X size={13} className="text-zinc-400" />
+              </button>
+            </div>
+
+            <div className="h-px bg-black/[0.06] mx-3" />
+
+            {/* Note textarea — grows up to 3 lines (~72 px) then scrolls */}
+            <div className="px-3 pt-2.5 pb-3">
+              <textarea
+                ref={noteTextareaRef}
+                autoFocus
+                placeholder="Add a note… (optional)"
+                value={pendingNote}
+                rows={1}
+                onChange={(e) => setPendingNote(e.target.value)}
+                onInput={(e) => {
+                  const ta = e.currentTarget;
+                  ta.style.height = 'auto';
+                  ta.style.height = `${Math.min(ta.scrollHeight, 72)}px`;
+                }}
+                className="w-full resize-none text-sm rounded-xl px-3 py-2 outline-none border-none placeholder:text-zinc-400 text-zinc-800"
+                style={{
+                  background: 'rgba(0,0,0,0.05)',
+                  minHeight: '36px',
+                  maxHeight: '72px',
+                  overflowY: 'auto',
+                  lineHeight: '1.55',
+                }}
+              />
+
+              <div className="flex items-center gap-2 mt-2">
+                <button
+                  onClick={() => { setPendingHighlight(null); setPendingNote(''); }}
+                  className="flex-1 py-2 rounded-xl text-sm font-semibold text-zinc-500 hover:bg-black/5 transition-colors"
+                >
+                  Back
+                </button>
+                <button
+                  onClick={() => confirmHighlight(pendingNote)}
+                  className="flex-1 py-2 rounded-xl text-sm font-bold text-white transition-opacity active:opacity-80"
+                  style={{ background: '#1C1C1E' }}
+                >
+                  Save
+                </button>
+              </div>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -1542,15 +1848,17 @@ export default function Reader({ book, onClose }: ReaderProps) {
       <AnimatePresence>
         {highlightToErase && (
           <motion.div
-            initial={{ opacity: 0, scale: 0.8, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: -50 }}
-            exit={{ opacity: 0, scale: 0.8 }}
+            initial={{ opacity: 0, scale: 0.8, x: '-50%', y: 10 }}
+            animate={{ opacity: 1, scale: 1, x: '-50%', y: -60 }}
+            exit={{ opacity: 0, scale: 0.8, x: '-50%', y: 10 }}
             style={{ 
-              left: highlightToErase.position.x, 
+              left: Math.min(
+                Math.max(highlightToErase.position.x, 80),
+                (typeof window !== 'undefined' ? window.innerWidth : 375) - 80,
+              ),
               top: highlightToErase.position.y,
               position: 'absolute',
               zIndex: 100,
-              transform: 'translateX(-50%)'
             }}
             className="flex items-center gap-3 p-2 bg-white/90 dark:bg-zinc-800/90 backdrop-blur-3xl rounded-full shadow-[0_10px_40px_rgba(0,0,0,0.2)] border border-white/40"
           >
@@ -1607,33 +1915,13 @@ export default function Reader({ book, onClose }: ReaderProps) {
           )}
         </AnimatePresence>
 
-        {/* Transparent tap zones (20/60/20) for reliable click behavior */}
-        <div className={cn(
-          "absolute inset-0 z-20 flex select-none",
-          activeTab || showQuickActions ? "pointer-events-none" : "pointer-events-auto"
-        )}>
-          <button
-            type="button"
-            className="w-[20%] h-full bg-transparent"
-            onClick={(e) => { e.stopPropagation(); prev().catch(console.error); }}
-            onTouchEnd={(e) => { e.stopPropagation(); prev().catch(console.error); }}
-            aria-label="Previous page"
-          />
-          <button
-            type="button"
-            className="w-[60%] h-full bg-transparent"
-            onTouchStart={handleCenterTouchStart}
-            onTouchEnd={handleCenterTouchEnd}
-            onClick={handleCenterClick}
-            aria-label="Toggle controls"
-          />
-          <button
-            type="button"
-            className="w-[20%] h-full bg-transparent"
-            onClick={(e) => { e.stopPropagation(); next().catch(console.error); }}
-            onTouchEnd={(e) => { e.stopPropagation(); next().catch(console.error); }}
-            aria-label="Next page"
-          />
+        {/* Transparent tap zones (20/60/20) — always pointer-events-none so touches
+            reach the epub iframe for text selection. Navigation is handled by the
+            renditionInstance 'click' event which calls handleRegionTap internally. */}
+        <div className="absolute inset-0 z-20 flex select-none pointer-events-none">
+          <div className="w-[20%] h-full" />
+          <div className="w-[60%] h-full" />
+          <div className="w-[20%] h-full" />
         </div>
 
         {/* Page Indicator Overlay */}
@@ -1701,7 +1989,7 @@ export default function Reader({ book, onClose }: ReaderProps) {
                       exit={{ opacity: 0, y: 8, scale: 0.94, filter: 'blur(8px)' }}
                       transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
                       style={{ transformOrigin: 'bottom right' }}
-                      className="absolute bottom-14 right-0 w-60 rounded-[1.45rem] bg-white/[0.96] dark:bg-zinc-900/95 p-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.08)] backdrop-blur-xl border border-black/[0.04]"
+                      className="absolute bottom-14 right-0 w-60 rounded-[1.45rem] bg-white p-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.12)] border border-black/[0.04]"
                       onClick={(e) => e.stopPropagation()}
                     >
                       <button
@@ -1834,21 +2122,36 @@ export default function Reader({ book, onClose }: ReaderProps) {
             initial={{ y: '100%' }}
             animate={{ y: 0 }}
             exit={{ y: '100%' }}
-            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            transition={{ duration: 0.45, ease: [0.32, 0.72, 0, 1] }}
             onClick={(e) => {
               e.stopPropagation();
             }}
-            className="absolute bottom-0 left-0 right-0 bg-white/[0.96] dark:bg-zinc-900/95 backdrop-blur-2xl rounded-t-[2.5rem] shadow-[0_-4px_24px_rgba(0,0,0,0.08)] z-40 p-8 pb-12 max-h-[85vh] overflow-y-auto border-t border-black/[0.04]"
+            className="absolute bottom-0 left-0 right-0 rounded-t-[3rem] shadow-[0_-20px_80px_rgba(0,0,0,0.15)] z-40 p-8 pb-12 max-h-[85vh] overflow-y-auto"
+            style={{
+              backgroundColor: '#FFFFFF',
+              color: '#1C1C1E',
+              borderTop: '1px solid rgba(0,0,0,0.06)',
+            }}
           >
-            <div className="w-12 h-1.5 bg-black/10 dark:bg-white/10 rounded-full mx-auto mb-8" />
+            <div
+              className="w-12 h-1.5 rounded-full mx-auto mb-8"
+              style={{ backgroundColor: 'rgba(0,0,0,0.12)' }}
+            />
             
             <div className="max-w-md mx-auto">
               {activeTab === 'toc' && (
                 <div className="space-y-6">
                   <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-sm font-bold">Table of Contents</h3>
-                    <button onClick={closePanel} className="p-1 hover:bg-black/5 rounded-full">
-                      <X size={18} />
+                    <h3 className="text-sm font-bold" style={{ color: '#1C1C1E' }}>Table of Contents</h3>
+                    <button
+                      onClick={closePanel}
+                      className="p-1.5 rounded-full transition-colors"
+                      style={{
+                        background: 'rgba(0,0,0,0.06)',
+                        color: '#1C1C1E',
+                      }}
+                    >
+                      <X size={16} />
                     </button>
                   </div>
                   
@@ -1856,7 +2159,7 @@ export default function Reader({ book, onClose }: ReaderProps) {
                     {toc.length > 0 ? (
                       renderTocItems(toc)
                     ) : (
-                      <p className="text-center py-8 text-ink/50">No table of contents available.</p>
+                      <p className="text-center py-8" style={{ color: `${'#1C1C1E'}E6` }}>No table of contents available.</p>
                     )}
                   </div>
                 </div>
@@ -1865,33 +2168,51 @@ export default function Reader({ book, onClose }: ReaderProps) {
               {activeTab === 'highlights' && (
                 <div className="space-y-5">
                   <div className="flex justify-between items-center">
-                    <h3 className="text-sm font-bold">Bookmarks &amp; Highlights</h3>
-                    <button onClick={closePanel} className="p-1 hover:bg-black/5 rounded-full">
-                      <X size={18} />
+                    <h3 className="text-sm font-bold" style={{ color: '#1C1C1E' }}>Bookmarks &amp; Highlights</h3>
+                    <button
+                      onClick={closePanel}
+                      className="p-1.5 rounded-full transition-colors"
+                      style={{
+                        background: 'rgba(0,0,0,0.06)',
+                        color: '#1C1C1E',
+                      }}
+                    >
+                      <X size={16} />
                     </button>
                   </div>
 
                   {/* Segmented tab control */}
-                  <div className="flex bg-zinc-100 dark:bg-zinc-800/50 rounded-xl p-1 gap-1">
+                  <div
+                    className="flex rounded-xl p-1 gap-1"
+                    style={{ background: 'rgba(0,0,0,0.06)' }}
+                  >
                     <button
                       onClick={() => setAnnotationsTab('bookmarks')}
-                      className={cn(
-                        'flex-1 py-2 rounded-lg text-sm font-semibold transition-all',
-                        annotationsTab === 'bookmarks'
-                          ? 'bg-white dark:bg-zinc-700 shadow-sm text-ink'
-                          : 'text-ink/50'
-                      )}
+                      className="flex-1 py-2 rounded-lg text-sm font-semibold transition-all"
+                      style={{
+                        background: annotationsTab === 'bookmarks'
+                          ? 'rgba(255,255,255,0.95)'
+                          : 'transparent',
+                        color: annotationsTab === 'bookmarks'
+                          ? '#1C1C1E'
+                          : `${'#1C1C1E'}CC`,
+                        boxShadow: annotationsTab === 'bookmarks' ? '0 1px 4px rgba(0,0,0,0.08)' : 'none',
+                      }}
                     >
                       Bookmarks
                     </button>
                     <button
                       onClick={() => setAnnotationsTab('highlights')}
-                      className={cn(
-                        'flex-1 py-2 rounded-lg text-sm font-semibold transition-all',
-                        annotationsTab === 'highlights'
-                          ? 'bg-white dark:bg-zinc-700 shadow-sm text-ink'
-                          : 'text-ink/50'
-                      )}
+                      className="flex-1 py-2 rounded-lg text-sm font-semibold transition-all"
+                      style={{
+                        background: annotationsTab === 'highlights'
+                          ? 'rgba(255,255,255,0.95)'
+                          : 'transparent',
+                        color: annotationsTab === 'highlights'
+                          ? '#1C1C1E'
+                          : `${'#1C1C1E'}CC`,
+                        boxShadow: annotationsTab === 'highlights' ? '0 1px 4px rgba(0,0,0,0.08)' : 'none',
+                      }}
                     >
                       Highlights
                     </button>
@@ -1906,7 +2227,11 @@ export default function Reader({ book, onClose }: ReaderProps) {
                           return (
                             <div
                               key={i}
-                              className="flex items-center gap-3 p-4 rounded-xl bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-700"
+                              className="flex items-center gap-3 p-4 rounded-xl"
+                              style={{
+                                background: 'rgba(0,0,0,0.04)',
+                                border: '1px solid rgba(0,0,0,0.07)',
+                              }}
                             >
                               <BookmarkIcon size={15} className="text-gold fill-current flex-shrink-0" />
                               <button
@@ -1917,10 +2242,10 @@ export default function Reader({ book, onClose }: ReaderProps) {
                                   closePanel();
                                 }}
                               >
-                                <p className="text-sm font-semibold text-ink dark:text-white leading-snug">
+                                <p className="text-sm font-semibold leading-snug" style={{ color: '#1C1C1E' }}>
                                   {chapter || 'Bookmark'}
                                 </p>
-                                <p className="text-[11px] text-ink/50 mt-0.5">Saved location</p>
+                                <p className="text-[11px] mt-0.5" style={{ color: `${'#1C1C1E'}A6` }}>Saved location</p>
                               </button>
                               <button
                                 onClick={(e) => {
@@ -1936,8 +2261,8 @@ export default function Reader({ book, onClose }: ReaderProps) {
                         })
                       ) : (
                         <div className="text-center py-10">
-                          <p className="text-sm text-ink/50">No bookmarks yet.</p>
-                          <p className="text-xs text-ink/30 mt-1">Tap "Add Bookmark" in the reader menu.</p>
+                          <p className="text-sm" style={{ color: `${'#1C1C1E'}A6` }}>No bookmarks yet.</p>
+                          <p className="text-xs mt-1" style={{ color: `${'#1C1C1E'}80` }}>Tap "Add Bookmark" in the reader menu.</p>
                         </div>
                       )}
                     </div>
@@ -1950,19 +2275,35 @@ export default function Reader({ book, onClose }: ReaderProps) {
                         highlights.map((h, i) => {
                           const chapter = resolveChapterTitle(h.cfiRange);
                           return (
-                            <div key={i} className="p-4 rounded-xl bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-700">
+                            <div
+                              key={i}
+                              className="p-4 rounded-xl"
+                              style={{
+                                background: 'rgba(0,0,0,0.04)',
+                                border: '1px solid rgba(0,0,0,0.07)',
+                              }}
+                            >
                               <div className="flex items-start gap-3">
                                 <div className="w-3 h-3 rounded-full mt-1 flex-shrink-0" style={{ backgroundColor: h.color }} />
-                                <div className="flex-1 min-w-0">
-                                  <p className="text-sm text-ink dark:text-white mb-1.5 leading-snug">{h.text}</p>
-                                  {chapter && <p className="text-[10px] text-ink/40 font-medium mb-1.5">{chapter}</p>}
+                              <div className="flex-1 min-w-0">
+                                  <p className="text-sm mb-1.5 leading-snug" style={{ color: '#1C1C1E' }}>{h.text}</p>
+                                  {h.note && (
+                                    <p
+                                      className="text-xs italic mb-1.5 leading-relaxed"
+                                      style={{ color: `${'#1C1C1E'}CC` }}
+                                    >
+                                      “{h.note}”
+                                    </p>
+                                  )}
+                                  {chapter && <p className="text-[10px] font-medium mb-1.5" style={{ color: `${'#1C1C1E'}A6` }}>{chapter}</p>}
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       rendition?.display(h.cfiRange);
                                       closePanel();
                                     }}
-                                    className="text-[10px] font-bold uppercase tracking-wider text-ink/50 hover:text-ink transition-colors"
+                                    className="text-[10px] font-bold uppercase tracking-wider transition-colors"
+                                    style={{ color: `${'#1C1C1E'}CC` }}
                                   >
                                     Go to highlight
                                   </button>
@@ -1982,8 +2323,8 @@ export default function Reader({ book, onClose }: ReaderProps) {
                         })
                       ) : (
                         <div className="text-center py-10">
-                          <p className="text-sm text-ink/50">No highlights yet.</p>
-                          <p className="text-xs text-ink/30 mt-1">Select text while reading to highlight it.</p>
+                          <p className="text-sm" style={{ color: `${'#1C1C1E'}A6` }}>No highlights yet.</p>
+                          <p className="text-xs mt-1" style={{ color: `${'#1C1C1E'}80` }}>Select text while reading to highlight it.</p>
                         </div>
                       )}
                     </div>
@@ -1994,16 +2335,23 @@ export default function Reader({ book, onClose }: ReaderProps) {
               {activeTab === 'search' && (
                 <div className="space-y-6">
                   <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-sm font-bold">Search</h3>
-                    <button onClick={closePanel} className="p-1 hover:bg-black/5 rounded-full">
-                      <X size={18} />
+                    <h3 className="text-sm font-bold" style={{ color: '#1C1C1E' }}>Search</h3>
+                    <button
+                      onClick={closePanel}
+                      className="p-1.5 rounded-full transition-colors"
+                      style={{
+                        background: 'rgba(0,0,0,0.06)',
+                        color: '#1C1C1E',
+                      }}
+                    >
+                      <X size={16} />
                     </button>
                   </div>
                   <div className="space-y-4">
                     <div className="flex items-center gap-3">
                       <div className="relative flex-1">
-                        <input 
-                          type="search" 
+                        <input
+                          type="search"
                           inputMode="search"
                           autoCapitalize="none"
                           autoCorrect="off"
@@ -2017,15 +2365,20 @@ export default function Reader({ book, onClose }: ReaderProps) {
                             setHasTriggeredSearch(false);
                           }}
                           onKeyDown={handleSearchKeyDown}
-                          className="w-full bg-zinc-100 dark:bg-zinc-800 border-none rounded-xl py-3 pl-10 pr-4 text-sm focus:ring-2 focus:ring-gold outline-none"
+                          className="w-full border-none rounded-xl py-3 pl-10 pr-4 text-sm focus:ring-2 focus:ring-gold outline-none"
+                          style={{
+                            background: 'rgba(0,0,0,0.06)',
+                            color: '#1C1C1E',
+                          }}
                         />
-                        <Search size={16} className="absolute left-3.5 top-3.5 text-zinc-400" />
+                        <Search size={16} className="absolute left-3.5 top-3.5" style={{ color: `${'#1C1C1E'}50` }} />
                       </div>
                       <button
                         type="button"
                         onClick={triggerSearch}
                         disabled={isSearching || !searchQuery.trim()}
-                        className="rounded-xl bg-black px-4 py-3 text-sm font-semibold text-white transition-opacity disabled:opacity-50"
+                        className="rounded-xl px-4 py-3 text-sm font-semibold text-white transition-opacity disabled:opacity-50"
+                        style={{ background: '#1C1C1E' }}
                       >
                         Search
                       </button>
@@ -2033,12 +2386,16 @@ export default function Reader({ book, onClose }: ReaderProps) {
                         type="button"
                         onClick={clearSearchState}
                         disabled={!searchQuery && searchResults.length === 0}
-                        className="rounded-xl border border-zinc-300 px-4 py-3 text-sm font-semibold text-zinc-700 transition-opacity disabled:opacity-40"
+                        className="rounded-xl px-4 py-3 text-sm font-semibold transition-opacity disabled:opacity-40"
+                        style={{
+                          border: '1px solid rgba(0,0,0,0.18)',
+                          color: '#1C1C1E',
+                        }}
                       >
                         Clear
                       </button>
                     </div>
-                    <p className="text-xs text-center text-zinc-500">
+                    <p className="text-xs text-center" style={{ color: `${'#1C1C1E'}60` }}>
                       {isSearching ? 'Searching...' : searchResults.length > 0 ? `Found ${searchResults.length} result${searchResults.length !== 1 ? 's' : ''}` : ''}
                     </p>
                   </div>
@@ -2053,15 +2410,19 @@ export default function Reader({ book, onClose }: ReaderProps) {
                             e.stopPropagation();
                             await navigateToSearchResult(result);
                           }}
-                          className="w-full text-left p-4 rounded-xl bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-100 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+                          className="w-full text-left p-4 rounded-xl transition-colors"
+                          style={{
+                            background: 'rgba(0,0,0,0.04)',
+                            border: '1px solid rgba(0,0,0,0.07)',
+                          }}
                         >
-                          <p className="text-sm text-ink dark:text-white mb-2 line-clamp-3">{result.excerpt}</p>
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-ink/50">Result {idx + 1}</span>
+                          <p className="text-sm mb-2 line-clamp-3" style={{ color: '#1C1C1E' }}>{result.excerpt}</p>
+                          <span className="text-[10px] font-bold uppercase tracking-wider" style={{ color: `${'#1C1C1E'}50` }}>Result {idx + 1}</span>
                         </button>
                       ))}
                     </div>
                   ) : (
-                    <p className="text-center py-8 text-ink/50">
+                    <p className="text-center py-8" style={{ color: `${'#1C1C1E'}60` }}>
                       {isSearching ? 'Searching...' : hasTriggeredSearch ? 'No results found.' : 'Tap Search to look in the book'}
                     </p>
                   )}
@@ -2069,75 +2430,154 @@ export default function Reader({ book, onClose }: ReaderProps) {
               )}
 
               {activeTab === 'settings' && (
-                <div className="space-y-6">
-                  <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-sm font-bold">Settings</h3>
-                    <button onClick={closePanel} className="p-1 hover:bg-black/5 rounded-full">
-                      <X size={18} />
+                <div className="space-y-5">
+                  <div className="flex justify-between items-center mb-2">
+                    <h3 className="text-sm font-bold" style={{ color: '#1C1C1E' }}>Appearance</h3>
+                    <button
+                      onClick={closePanel}
+                      className="p-1.5 rounded-full transition-colors"
+                      style={{
+                        background: 'rgba(0,0,0,0.06)',
+                        color: '#1C1C1E',
+                      }}
+                    >
+                      <X size={16} />
                     </button>
                   </div>
-                  <div className="p-4 rounded-xl bg-zinc-50 border border-zinc-100">
-                    <div className="flex flex-col gap-3">
-                      <span className="text-sm font-medium">Theme</span>
-                      <div className="flex gap-3">
-                        <button
-                          onClick={() => setPageTone('light')}
-                          className={cn(
-                            "flex-1 py-2 rounded-lg border-2 font-medium text-sm transition-colors",
-                            pageTone === 'light' ? "border-gold text-ink" : "border-transparent bg-white text-ink/70 hover:bg-white/80"
-                          )}
-                          style={{ backgroundColor: '#FAF7F2' }}
-                        >
-                          Light
-                        </button>
-                        <button
-                          onClick={() => setPageTone('sepia')}
-                          className={cn(
-                            "flex-1 py-2 rounded-lg border-2 font-medium text-sm transition-colors",
-                            pageTone === 'sepia' ? "border-gold text-[#433422]" : "border-transparent text-[#433422]/70 hover:opacity-80"
-                          )}
-                          style={{ backgroundColor: '#F4ECD8' }}
-                        >
-                          Sepia
-                        </button>
-                        <button
-                          onClick={() => setPageTone('dark')}
-                          className={cn(
-                            "flex-1 py-2 rounded-lg border-2 font-medium text-sm transition-colors",
-                            pageTone === 'dark' ? "border-gold text-[#F4F1E8]" : "border-transparent text-[#F4F1E8]/70 hover:opacity-80"
-                          )}
-                          style={{ backgroundColor: '#111214' }}
-                        >
-                          Dark
-                        </button>
-                      </div>
+
+                  {/* ── Theme picker ── */}
+                  <div
+                    className="rounded-2xl p-4 space-y-3"
+                    style={{
+                      background: 'rgba(0,0,0,0.04)',
+                    }}
+                  >
+                    <span
+                      className="text-[11px] font-bold uppercase tracking-widest"
+                      style={{ color: 'rgba(0,0,0,0.35)' }}
+                    >
+                      Theme
+                    </span>
+                    <div className="grid grid-cols-3 gap-3">
+                      {([
+                        {
+                          id: 'light' as const,
+                          label: 'Light',
+                          bg: '#FAF7F2',
+                          color: '#1C1C1E',
+                          stripe: '#E8E2D8',
+                          icon: '☀️',
+                        },
+                        {
+                          id: 'sepia' as const,
+                          label: 'Sepia',
+                          bg: '#F4ECD8',
+                          color: '#433422',
+                          stripe: '#D9C9A8',
+                          icon: '📜',
+                        },
+                        {
+                          id: 'dark' as const,
+                          label: 'Dark',
+                          bg: '#111214',
+                          color: '#F4F1E8',
+                          stripe: '#2A2A2E',
+                          icon: '🌙',
+                        },
+                      ]).map((t) => {
+                        const active = pageTone === t.id;
+                        return (
+                          <button
+                            key={t.id}
+                            onClick={() => setPageTone(t.id)}
+                            className="relative flex flex-col items-center rounded-2xl overflow-hidden transition-transform active:scale-95"
+                            style={{
+                              outline: active ? `2.5px solid #C9A84C` : '2.5px solid transparent',
+                              outlineOffset: '1px',
+                              boxShadow: active
+                                ? '0 0 0 4px rgba(201,168,76,0.18)'
+                                : '0 2px 8px rgba(0,0,0,0.10)',
+                            }}
+                            aria-label={`${t.label} theme`}
+                          >
+                            {/* Swatch preview */}
+                            <div
+                              className="w-full h-16 flex flex-col justify-center items-start px-3 gap-1.5"
+                              style={{ backgroundColor: t.bg }}
+                            >
+                              {/* Fake text lines */}
+                              <div className="w-4/5 h-1.5 rounded-full" style={{ backgroundColor: t.stripe }} />
+                              <div className="w-3/5 h-1.5 rounded-full" style={{ backgroundColor: t.stripe }} />
+                              <div className="w-4/5 h-1.5 rounded-full" style={{ backgroundColor: t.stripe }} />
+                            </div>
+                            {/* Label row */}
+                            <div
+                              className="w-full flex flex-col items-center py-2"
+                              style={{
+                                backgroundColor: 'rgba(0,0,0,0.04)',
+                              }}
+                            >
+                              <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: '#1C1C1E' }}>
+                                {t.label}
+                              </span>
+                            </div>
+                            {/* Active check */}
+                            {active && (
+                              <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[#C9A84C] flex items-center justify-center shadow">
+                                <svg viewBox="0 0 10 10" width="8" height="8" fill="none">
+                                  <path d="M2 5l2.2 2.2L8 3" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                              </div>
+                            )}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
-                  <div className="p-4 rounded-xl bg-zinc-50 border border-zinc-100">
-                    <div className="flex flex-col gap-3">
-                      <span className="text-sm font-medium">Page Turn Style</span>
-                      <div className="grid grid-cols-3 gap-2">
-                        {([
-                          { id: 'curl',     label: 'Curl',      icon: '↷', desc: 'Page curl feel' },
-                          { id: 'slide',    label: 'Slide',     icon: '⇄', desc: 'Smooth slide'   },
-                          { id: 'fastfade', label: 'Fade',      icon: '✦', desc: 'Quick crossfade' },
-                        ] as { id: PageTransition; label: string; icon: string; desc: string }[]).map(opt => (
+
+                  {/* ── Page Turn picker ── */}
+                  <div
+                    className="rounded-2xl p-4 space-y-3"
+                    style={{
+                      background: 'rgba(0,0,0,0.04)',
+                    }}
+                  >
+                    <span
+                      className="text-[11px] font-bold uppercase tracking-widest"
+                      style={{ color: 'rgba(0,0,0,0.35)' }}
+                    >
+                      Page Turn
+                    </span>
+                    <div className="grid grid-cols-3 gap-3">
+                      {([
+                        { id: 'curl'     as PageTransition, label: 'Curl',  icon: '↷', desc: 'Classic' },
+                        { id: 'slide'    as PageTransition, label: 'Slide', icon: '⇄', desc: 'Smooth' },
+                        { id: 'fastfade' as PageTransition, label: 'Fade',  icon: '✦', desc: 'Instant' },
+                      ]).map((opt) => {
+                        const active = pageTransition === opt.id;
+                        return (
                           <button
                             key={opt.id}
                             onClick={() => setPageTransition(opt.id)}
-                            className={cn(
-                              "flex flex-col items-center gap-1 py-3 px-2 rounded-xl border-2 transition-all text-center",
-                              pageTransition === opt.id
-                                ? "border-gold bg-gold/10 shadow-sm"
-                                : "border-transparent bg-white hover:bg-white/80"
-                            )}
+                            className="flex flex-col items-center gap-1.5 py-3.5 px-2 rounded-2xl transition-transform active:scale-95"
+                            style={{
+                              outline: active ? '2.5px solid #C9A84C' : '2.5px solid transparent',
+                              outlineOffset: '1px',
+                              boxShadow: active
+                                ? '0 0 0 4px rgba(201,168,76,0.18)'
+                                : '0 2px 8px rgba(0,0,0,0.10)',
+                              background: 'rgba(255,255,255,0.85)',
+                            }}
                           >
-                            <span className="text-xl">{opt.icon}</span>
-                            <span className="text-xs font-bold">{opt.label}</span>
-                            <span className="text-[10px] opacity-50">{opt.desc}</span>
+                            <span className="text-xl leading-none">{opt.icon}</span>
+                            <span className="text-[11px] font-bold" style={{ color: '#1C1C1E' }}>{opt.label}</span>
+                            <span className="text-[9px] opacity-50" style={{ color: '#1C1C1E' }}>{opt.desc}</span>
+                            {active && (
+                              <div className="absolute" style={{ display: 'none' }} />
+                            )}
                           </button>
-                        ))}
-                      </div>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>

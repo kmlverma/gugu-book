@@ -6,7 +6,12 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     androidScheme: 'https'
-  }
+  },
+  plugins: {
+    Keyboard: {
+      resize: 'none',
+    },
+  },
 };
 
 export default config;
